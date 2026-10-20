@@ -3,6 +3,11 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { composerContainsOwnedText, ownCollapsedPaste, type ComposerInput, type ComposerOwnership } from "./composer-prompts.js";
 
+// A live Claude seat redraws its box for a moment after a paste; a snapshot taken then is discarded and
+// reads unknown. The post-paste read retries this many times, this far apart, before it records nothing.
+const PASTE_SETTLE_READS = 10;
+const PASTE_SETTLE_INTERVAL_MS = 50;
+
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
 export interface GuardTarget {
   nodeId: string;
@@ -389,7 +394,12 @@ export class SeatDeliveryGuard {
       const target = this.target(name);
       const lease = this.scope.getStore()!.get(target.nodeId)!;
       lease.staged = { text, collapsedPaste: null };
-      const input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
+      let input: ComposerInput | null = null;
+      for (let read = 0; read < PASTE_SETTLE_READS; read++) {
+        if (read > 0) await new Promise(resolve => setTimeout(resolve, PASTE_SETTLE_INTERVAL_MS));
+        input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
+        if (input && input.state !== "unknown") break;
+      }
       if (input) lease.staged.collapsedPaste = ownCollapsedPaste(input, text);
     } catch { /* Observation cannot turn a completed paste into a claimed no-write failure. */ }
   }

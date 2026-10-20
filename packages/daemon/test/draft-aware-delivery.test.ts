@@ -204,6 +204,38 @@ describe("single-attempt draft-aware delivery through the real transport", () =>
     await f.send("late"); expect(f.writes).toHaveLength(1); expect(f.submissions).toEqual([]);
   });
 
+  it("reads a collapsed paste again when the first read after the paste lands mid-redraw", async () => {
+    // A live Claude seat redraws its box for a moment after a paste, and a snapshot taken then is
+    // discarded (the cursor moves between its two reads), so the first read is unknown. Seen on
+    // Claude Code 2.1.289 with a 7-line envelope, which Claude shows as `[Pasted text #7 +6 lines]`.
+    const f = fixture(); await f.enable();
+    const envelope = ["From: lead@test", "To: worker@test", "Sent: 10-20 18:45Z", "---", "body", "---", "↩ Reply: rig send lead@test \"...\""].join("\n");
+    let redrawing = false;
+    f.hooks.paste = () => { redrawing = true; };
+    vi.mocked(f.tmux.captureComposerSnapshot).mockImplementation(async name => {
+      const node = f.guard.target(name).nodeId;
+      if (node === "a" && redrawing) { redrawing = false; return null; }
+      const body = f.bodies[node];
+      return body == null ? null : frame(body === envelope ? "[Pasted text #7 +6 lines]" : body);
+    });
+    expect(await f.send("collapsed", envelope, { verify: false })).toMatchObject({ ok: true, sent: true, delivery: { state: "complete" } });
+    expect(f.submissions).toEqual([envelope]);
+  });
+
+  it("still refuses Enter when the box never settles after the paste", async () => {
+    const f = fixture(); await f.enable();
+    const envelope = ["From: lead@test", "To: worker@test", "---", "body", "---", "end", "last"].join("\n");
+    let pasted = false;
+    f.hooks.paste = () => { pasted = true; };
+    vi.mocked(f.tmux.captureComposerSnapshot).mockImplementation(async name => {
+      const node = f.guard.target(name).nodeId;
+      if (node === "a" && pasted) return null;
+      const body = f.bodies[node]; return body == null ? null : frame(body);
+    });
+    expect(await f.send("unsettled", envelope, { verify: false })).toMatchObject({ ok: false, sent: true, delivery: { state: "indeterminate" } });
+    expect(f.submissions).toEqual([]);
+  });
+
   it.each([false, true])("does not claim no write for an unknown native result (wait mode: %s)", async wait => {
     const f = fixture(); await f.enable();
     f.hooks.paste = () => { f.bodies.a = "incoming message"; throw new Error("lost native result after dispatch"); };
