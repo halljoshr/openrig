@@ -116,3 +116,46 @@ describe("cursor-bound composer input", () => {
     expect(ownCollapsedPaste(inspectComposerInput(claude("[Pasted text #4 +2 lines] foreign")), "one\ntwo\nthree")).toBeNull();
   });
 });
+
+// The bottom rows of a live Claude Code 2.1.289 seat in an 80x24 tmux pane, auto mode, captured with
+// `tmux capture-pane -p -e`. Only the seat name is changed. Claude draws its own cursor: a reverse-video
+// space after the last typed character, which the terminal cursor sits on.
+function liveClaude(prompt: string, cursorX: number): ComposerSnapshot {
+  const name = "dev-impl@my-rig";
+  const rows = [
+    ...Array<string>(14).fill(""),
+    "● Ready.",
+    "",
+    "\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mSautéed for 15s · done 2:24 PM\x1b[39m",
+    "",
+    `\x1b[38;5;244m${"─".repeat(80 - name.length - 3)} ${name} ─`,
+    `\x1b[39m❯ ${prompt}\x1b[0m\x1b[39m\x1b[49m`,
+    `\x1b[38;5;244m${"─".repeat(80)}`,
+    prompt.startsWith("\x1b[7m ")
+      ? "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle) · ← for agents\x1b[39m"
+      : "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m",
+    "",
+  ];
+  return { screen: rows.join("\n"), cursor: { x: cursorX, y: 19, width: 80, height: 24 }, inMode: false };
+}
+
+describe("a live Claude seat's drawn cursor", () => {
+  it("reads an empty box as empty, not as a typed space", () => {
+    expect(inspectComposerInput(liveClaude("\x1b[7m ", 2), "claude-code")).toMatchObject({ state: "empty", rows: [""] });
+  });
+
+  it("reads a draft as its typed text only", () => {
+    const input = inspectComposerInput(liveClaude("draft in progress\x1b[7m ", 19), "claude-code");
+    expect(input).toMatchObject({ state: "text", rows: ["draft in progress"], cursorAtEnd: true });
+  });
+
+  it("keeps a draft whose cursor sits on a typed character", () => {
+    expect(inspectComposerInput(liveClaude("\x1b[7md\x1b[0mraft", 2), "claude-code").state).toBe("text");
+    expect(inspectComposerInput(liveClaude("dr\x1b[7ma\x1b[0mft", 4), "claude-code")).toMatchObject({ state: "text", rows: ["draft"] });
+  });
+
+  it("keeps typed spaces that aren't the drawn cursor", () => {
+    expect(inspectComposerInput(liveClaude(" \x1b[7m ", 3), "claude-code").state).toBe("text");
+    expect(inspectComposerInput(liveClaude(" ", 2), "claude-code").state).toBe("text");
+  });
+});

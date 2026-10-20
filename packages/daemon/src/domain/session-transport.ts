@@ -260,13 +260,19 @@ const codexFooter = (line: string): boolean => isComposerFooter(line)
   || /(?:\b\d+% context left\b|\bContext \[)/.test(line);
 
 /** Preserve faint styling so autocomplete ghosts can be separated from authored
- * text. Color channel values must never be interpreted as style codes. */
+ * text, and reverse video so Claude's drawn cursor can be. Color channel values
+ * must never be interpreted as style codes. */
 function styledTextLines(screen: string) {
-  let faint = false;
+  let faint = false, inverse = false;
   return screen.replace(/\r\n/g, "\n").split("\n").map(raw => {
     let text = "", offset = 0;
     const faintCells: boolean[] = [];
-    const append = (value: string) => { text += value; faintCells.push(...Array<boolean>(value.length).fill(faint)); };
+    const inverseCells: boolean[] = [];
+    const append = (value: string) => {
+      text += value;
+      faintCells.push(...Array<boolean>(value.length).fill(faint));
+      inverseCells.push(...Array<boolean>(value.length).fill(inverse));
+    };
     for (const match of raw.matchAll(/\x1b\[([0-9;:]*)m/g)) {
       append(raw.slice(offset, match.index));
       const codes = match[1]!.split(";");
@@ -277,15 +283,18 @@ function styledTextLines(screen: string) {
           const skip = codes[i + 1] === "5" ? 2 : codes[i + 1] === "2" ? (codes[i + 2] === "" ? 5 : 4) : 0;
           // Color channels are not style codes. Ambiguous compound sequences
           // provide no faint-style proof, rather than interpreting an RGB 2 as dim.
-          if (!skip || i + skip !== codes.length - 1) { faint = false; break; }
+          if (!skip || i + skip !== codes.length - 1) { faint = false; inverse = false; break; }
           i += skip;
-        } else if (code === "" || code === "0" || code === "22") faint = false;
+        } else if (code === "" || code === "0") { faint = false; inverse = false; }
+        else if (code === "22") faint = false;
         else if (code === "2") faint = true;
+        else if (code === "7") inverse = true;
+        else if (code === "27") inverse = false;
       }
       offset = match.index! + match[0].length;
     }
     append(raw.slice(offset));
-    return { text, faintCells };
+    return { text, faintCells, inverseCells };
   });
 }
 
@@ -339,13 +348,20 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
     // A literal placeholder or text before a moved cursor remains authored input.
     const cursorRow = y - start;
     let ghost: ComposerInput["ghost"];
-    const currentRow = rows[cursorRow]!;
     let cursorOffset = x === prefix ? 0 : -1;
     let offset = 0;
-    for (const character of currentRow) {
+    for (const character of rows[cursorRow]!) {
       offset += character.length;
-      if (stringWidth(currentRow.slice(0, offset)) === x - prefix) cursorOffset = offset;
+      if (stringWidth(rows[cursorRow]!.slice(0, offset)) === x - prefix) cursorOffset = offset;
     }
+    // A live Claude seat draws its own cursor: one reverse-video space after the last typed
+    // character, under the terminal cursor. It isn't input, so an empty box with it stays empty.
+    // A reverse-video character, or any text after the cell, is still authored input.
+    if (cursorOffset >= 0 && cursorRow === rows.length - 1 && rows[cursorRow]![cursorOffset] === " "
+      && !rows[cursorRow]!.slice(cursorOffset + 1).trim() && styled[y]!.inverseCells[prefix + cursorOffset]) {
+      rows[cursorRow] = rows[cursorRow]!.slice(0, cursorOffset);
+    }
+    const currentRow = rows[cursorRow]!;
     if (cursorOffset >= 0) {
       const suffix = rows.slice(cursorRow).map((row, i) => ({
         text: row.slice(i === 0 ? cursorOffset : 0),
