@@ -10,8 +10,8 @@ const PASTE_SETTLE_INTERVAL_MS = 50;
 
 function refusedRead(input: ComposerInput | null): RefusedInput {
   return input
-    ? { state: input.state, rows: input.rows, cursorAtEnd: input.cursorAtEnd, collapsedPaste: input.collapsedPaste }
-    : { state: "unreadable", rows: [], cursorAtEnd: false, collapsedPaste: null };
+    ? { state: input.state, rowCount: input.rows.length, cursorAtEnd: input.cursorAtEnd, labelPresent: !!input.collapsedPaste }
+    : { state: "unreadable", rowCount: 0, cursorAtEnd: false, labelPresent: false };
 }
 
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
@@ -35,12 +35,13 @@ interface Lease {
   staged?: { text: string; collapsedPaste: string | null };
 }
 
-/** What the last input read saw when the guard refused, so the next refusal shows its exact trigger. */
+/** The shape of the last input read when the guard refused, so the next refusal shows its trigger. It holds no box
+ * text: the box can hold Josh's draft, and this reaches the outbox row. */
 export interface RefusedInput {
   state: ComposerInput["state"] | "unreadable";
-  rows: string[];
+  rowCount: number;
   cursorAtEnd: boolean;
-  collapsedPaste: string | null;
+  labelPresent: boolean;
 }
 
 export class DeliveryGuardError extends Error {
@@ -392,12 +393,13 @@ export class SeatDeliveryGuard {
       if (submit && input && input.state !== "unknown" && this.ownsStagedInput(lease, input)) break;
     }
     if (!input || input.state === "unknown") {
-      throw new DeliveryGuardError("draft_input_unknown", `The current input cannot be read. Automatic delivery is held.${submit ? " Enter was not sent." : ""}`,
+      throw new DeliveryGuardError("draft_input_unknown", submit ? "The current input cannot be read. Enter was not sent, and the text is still in the box."
+          : "The current input cannot be read. Automatic delivery is held.",
         refusedRead(input));
     }
     if (submit) {
       if (!this.ownsStagedInput(lease, input)) {
-        throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.", refusedRead(input));
+        throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent, and the text is still in the box.", refusedRead(input));
       }
     } else if (input.state !== "empty") {
       throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
@@ -406,12 +408,13 @@ export class SeatDeliveryGuard {
     }
   }
 
-  /** Whether the read shows exactly this delivery's staged text. The collapsed-paste label is recomputed on every
-   * read: a redraw can show it only after the paste-time reads gave up. */
+  /** Whether the read shows exactly this delivery's staged text. A collapsed-paste label seen at the paste is
+   * remembered there; a label that first shows now is adopted only on positive proof that it is this paste
+   * (pasteMatchesExpected), never from its line count, which another paste could share. */
   private ownsStagedInput(lease: Lease, input: ComposerInput): boolean {
     const staged = lease.staged;
     if (!staged) return false;
-    staged.collapsedPaste ??= ownCollapsedPaste(input, staged.text);
+    if (!staged.collapsedPaste && input.collapsedPaste && input.cursorAtEnd && input.pasteMatchesExpected) staged.collapsedPaste = input.collapsedPaste;
     return composerContainsOwnedText(input, staged.text)
       || !!staged.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === staged.collapsedPaste;
   }

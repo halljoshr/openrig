@@ -175,7 +175,8 @@ export function composerContainsOwnedText(input: ComposerInput, expected: string
 }
 
 /** An opaque label may be remembered only immediately after this lease pasted
- * the text. Subsequent submission requires that same complete label and cursor.
+ * the text, by a matching line count or by proof (pasteMatchesExpected). Subsequent submission requires that same
+ * complete label and cursor. A label first seen at the pre-Enter read is adopted only on proof, never on a count.
  */
 export function ownCollapsedPaste(input: ComposerInput, expected: string): string | null {
   if (input.collapsedPaste && input.cursorAtEnd && input.pasteMatchesExpected) return input.collapsedPaste;
