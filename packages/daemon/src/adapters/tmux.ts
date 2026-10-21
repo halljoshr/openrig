@@ -1,4 +1,4 @@
-import { DeliveryGuardError, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
+import { DeliveryGuardError, type RefusedInput, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
 import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
@@ -67,7 +67,7 @@ export function defaultTmuxFileOps(): TmuxFileOps {
 
 export type TmuxResult =
   | { ok: true; warnings?: string[] }
-  | { ok: false; code: string; message: string };
+  | { ok: false; code: string; message: string; refusedInput?: RefusedInput };
 
 export interface TmuxSession {
   name: string;
@@ -458,7 +458,9 @@ export class TmuxAdapter {
         return guard.input(identity, () => write(pane, () => guard.checkInput(identity)));
       });
     } catch (error) {
-      return { ok: false, code: (error as { code?: string }).code ?? "guard_target_unknown", message: String((error as Error).message) };
+      const refusedInput = error instanceof DeliveryGuardError ? error.refusedInput : undefined;
+      return { ok: false, code: (error as { code?: string }).code ?? "guard_target_unknown", message: String((error as Error).message),
+        ...(refusedInput ? { refusedInput } : {}) };
     }
   }
 

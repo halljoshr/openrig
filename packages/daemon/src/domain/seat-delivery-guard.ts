@@ -8,6 +8,12 @@ import { composerContainsOwnedText, ownCollapsedPaste, type ComposerInput, type 
 const PASTE_SETTLE_READS = 10;
 const PASTE_SETTLE_INTERVAL_MS = 50;
 
+function refusedRead(input: ComposerInput | null): RefusedInput {
+  return input
+    ? { state: input.state, rows: input.rows, cursorAtEnd: input.cursorAtEnd, collapsedPaste: input.collapsedPaste }
+    : { state: "unreadable", rows: [], cursorAtEnd: false, collapsedPaste: null };
+}
+
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
 export interface GuardTarget {
   nodeId: string;
@@ -29,8 +35,16 @@ interface Lease {
   staged?: { text: string; collapsedPaste: string | null };
 }
 
+/** What the last input read saw when the guard refused, so the next refusal shows its exact trigger. */
+export interface RefusedInput {
+  state: ComposerInput["state"] | "unreadable";
+  rows: string[];
+  cursorAtEnd: boolean;
+  collapsedPaste: string | null;
+}
+
 export class DeliveryGuardError extends Error {
-  constructor(readonly code: string, message: string) { super(message); }
+  constructor(readonly code: string, message: string, readonly refusedInput?: RefusedInput) { super(message); }
 
   // Hono's error protocol also preserves this typed refusal on lifecycle routes.
   getResponse(): Response {
@@ -368,18 +382,38 @@ export class SeatDeliveryGuard {
     const target = this.target(name);
     const lease = this.scope.getStore()!.get(target.nodeId)!;
     const owned = submit && lease.staged && lease.inputFrame ? { text: lease.staged.text, frame: lease.inputFrame } : undefined;
-    const input = await this.inspectInput?.(target, owned).catch(() => null) ?? null;
-    this.checkInput(name);
-    if (!input || input.state === "unknown") throw new DeliveryGuardError("draft_input_unknown", "The current input cannot be read. Automatic delivery is held.");
+    let input: ComposerInput | null = null;
+    // Before Enter the box may still be redrawing: read it again, as after the paste, until it is known and provably
+    // this delivery's own. The human-input check runs on every read, so a real edit still refuses at once.
+    for (let read = 0; read < (submit ? PASTE_SETTLE_READS : 1); read++) {
+      if (read > 0) await new Promise(resolve => setTimeout(resolve, PASTE_SETTLE_INTERVAL_MS));
+      input = await this.inspectInput?.(target, owned).catch(() => null) ?? null;
+      this.checkInput(name);
+      if (submit && input && input.state !== "unknown" && this.ownsStagedInput(lease, input)) break;
+    }
+    if (!input || input.state === "unknown") {
+      throw new DeliveryGuardError("draft_input_unknown", `The current input cannot be read. Automatic delivery is held.${submit ? " Enter was not sent." : ""}`,
+        refusedRead(input));
+    }
     if (submit) {
-      const owned = lease.staged && (composerContainsOwnedText(input, lease.staged.text)
-        || !!lease.staged.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === lease.staged.collapsedPaste);
-      if (!owned) throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.");
+      if (!this.ownsStagedInput(lease, input)) {
+        throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent.", refusedRead(input));
+      }
     } else if (input.state !== "empty") {
       throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
     } else {
       lease.inputFrame = input.frame;
     }
+  }
+
+  /** Whether the read shows exactly this delivery's staged text. The collapsed-paste label is recomputed on every
+   * read: a redraw can show it only after the paste-time reads gave up. */
+  private ownsStagedInput(lease: Lease, input: ComposerInput): boolean {
+    const staged = lease.staged;
+    if (!staged) return false;
+    staged.collapsedPaste ??= ownCollapsedPaste(input, staged.text);
+    return composerContainsOwnedText(input, staged.text)
+      || !!staged.collapsedPaste && input.cursorAtEnd && input.collapsedPaste === staged.collapsedPaste;
   }
 
   expectStagedInput(name: string, text: string): void {

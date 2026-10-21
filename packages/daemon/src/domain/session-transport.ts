@@ -1,3 +1,4 @@
+import type { RefusedInput } from "./seat-delivery-guard.js";
 import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
 import stringWidth from "string-width";
 import { CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
@@ -1681,6 +1682,8 @@ export interface SendResult {
    *  `attempted` — the text write was issued and reported a failure (it may still have landed);
    *  `written` — the text was written and the send stopped before or at Enter (it may sit in the input box). */
   inputPhase?: "not_reached" | "attempted" | "written";
+  /** What the guard's last input read saw when it refused Enter (a `draft_*` reason). */
+  refusedInput?: RefusedInput;
 }
 
 /** One reading of a Claude Code or Codex input box: `exact` (the sent text, word boundaries kept), `ambiguous`
@@ -2979,7 +2982,10 @@ export class SessionTransport {
           reason: policyRefusal ? submitResult.code : "submit_failed",
           outcome: "failed",
           inputPhase: "written",
-          error: `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
+          error: policyRefusal
+            ? `Text is in '${sessionName}', but Enter was not sent: ${submitResult.message}`
+            : `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
+          ...(policyRefusal && submitResult.refusedInput ? { refusedInput: submitResult.refusedInput } : {}),
           ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
         });
       }
