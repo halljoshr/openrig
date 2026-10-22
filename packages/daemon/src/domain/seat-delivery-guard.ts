@@ -21,6 +21,7 @@ const RAW_COLLAPSE_MS = 300;
 export interface PasteWatch {
   reads: number;
   unknownReads: number;
+  notDrawnReads: number;
   ownTextReads: number;
   foreignReads: number;
   labelSeen: boolean;
@@ -455,7 +456,7 @@ export class SeatDeliveryGuard {
       if (!this.needsInputCheck(name)) return;
       const target = this.target(name);
       const lease = this.scope.getStore()!.get(target.nodeId)!;
-      const watch: PasteWatch = { reads: 0, unknownReads: 0, ownTextReads: 0, foreignReads: 0, labelSeen: false, labelAdopted: false, labelFirstSeenMs: null };
+      const watch: PasteWatch = { reads: 0, unknownReads: 0, notDrawnReads: 0, ownTextReads: 0, foreignReads: 0, labelSeen: false, labelAdopted: false, labelFirstSeenMs: null };
       const staged: NonNullable<Lease["staged"]> = { text, collapsedPaste: null, watch };
       lease.staged = staged;
       const started = Date.now();
@@ -465,6 +466,10 @@ export class SeatDeliveryGuard {
         const elapsed = Date.now() - started;
         watch.reads++;
         if (!input || input.state === "unknown") { watch.unknownReads++; continue; }
+        // The seat can draw the paste a moment after it lands, so the first reads may still show the box exactly as
+        // it was before the paste. Only before our text or a label has shown: an empty box after them is a human's.
+        if (input.state === "empty" && watch.ownTextReads === 0 && !watch.labelSeen
+          && !!input.frame && input.frame === lease.inputFrame) { watch.notDrawnReads++; continue; }
         if (composerContainsOwnedText(input, text)) {
           watch.ownTextReads++;
           // One line never collapses; several may, but only within RAW_COLLAPSE_MS.
