@@ -4,14 +4,37 @@ import type Database from "better-sqlite3";
 import { composerContainsOwnedText, ownCollapsedPaste, type ComposerInput, type ComposerOwnership } from "./composer-prompts.js";
 
 // A live Claude seat redraws its box for a moment after a paste; a snapshot taken then is discarded and
-// reads unknown. The post-paste read retries this many times, this far apart, before it records nothing.
+// reads unknown. The pre-Enter read retries this many times, this far apart, before it refuses.
 const PASTE_SETTLE_READS = 10;
 const PASTE_SETTLE_INTERVAL_MS = 50;
+// After the paste the guard watches the box until it learns how the seat drew it. A live Claude seat can show the
+// raw text first and collapse it to "[Pasted text #N +M lines]" a moment later, or show no readable box for longer
+// than the old 500 ms window; on 2026-10-22 13:27Z the label it never learned left a 7-line message typed without
+// Enter (AF-148). The watch is bounded by reads and by time, so a box that never becomes readable still refuses.
+const PASTE_WATCH_READS = 40;
+const PASTE_WATCH_MS = 2000;
+// A label that first shows after our raw text has sat on screen longer than this is not provably ours: a human could
+// have replaced it with another block of the same line count (AF-148 pre-build review r1).
+const RAW_COLLAPSE_MS = 300;
 
-function refusedRead(input: ComposerInput | null): RefusedInput {
+/** What the post-paste watch saw, by count only. */
+export interface PasteWatch {
+  reads: number;
+  unknownReads: number;
+  notDrawnReads: number;
+  ownTextReads: number;
+  foreignReads: number;
+  labelSeen: boolean;
+  labelAdopted: boolean;
+  labelFirstSeenMs: number | null;
+}
+
+function refusedRead(input: ComposerInput | null, lease: Lease): RefusedInput {
+  const frameMatched = !!input?.frame && input.frame === lease.inputFrame;
+  const paste = lease.staged?.watch ? { paste: { ...lease.staged.watch } } : {};
   return input
-    ? { state: input.state, rowCount: input.rows.length, cursorAtEnd: input.cursorAtEnd, labelPresent: !!input.collapsedPaste }
-    : { state: "unreadable", rowCount: 0, cursorAtEnd: false, labelPresent: false };
+    ? { state: input.state, rowCount: input.rows.length, cursorAtEnd: input.cursorAtEnd, labelPresent: !!input.collapsedPaste, frameMatched, ...paste }
+    : { state: "unreadable", rowCount: 0, cursorAtEnd: false, labelPresent: false, frameMatched, ...paste };
 }
 
 /** A binding is captured before waiting. Never rebind an old operation to a new occupant. */
@@ -32,7 +55,7 @@ interface Lease {
   config?: TypingGuardConfig;
   humanEpoch: number;
   inputFrame?: string;
-  staged?: { text: string; collapsedPaste: string | null };
+  staged?: { text: string; collapsedPaste: string | null; watch?: PasteWatch };
 }
 
 /** The shape of the last input read when the guard refused, so the next refusal shows its trigger. It holds no box
@@ -42,6 +65,9 @@ export interface RefusedInput {
   rowCount: number;
   cursorAtEnd: boolean;
   labelPresent: boolean;
+  /** Whether the read's frame equals the one read before the paste. */
+  frameMatched: boolean;
+  paste?: PasteWatch;
 }
 
 export class DeliveryGuardError extends Error {
@@ -395,11 +421,11 @@ export class SeatDeliveryGuard {
     if (!input || input.state === "unknown") {
       throw new DeliveryGuardError("draft_input_unknown", submit ? "The current input cannot be read. Enter was not sent, and the text is still in the box."
           : "The current input cannot be read. Automatic delivery is held.",
-        refusedRead(input));
+        refusedRead(input, lease));
     }
     if (submit) {
       if (!this.ownsStagedInput(lease, input)) {
-        throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent, and the text is still in the box.", refusedRead(input));
+        throw new DeliveryGuardError("draft_input_changed", "The input no longer contains only this delivery's staged text. Enter was not sent, and the text is still in the box.", refusedRead(input, lease));
       }
     } else if (input.state !== "empty") {
       throw new DeliveryGuardError("draft_input_busy", "The seat has an unsubmitted input. Automatic delivery is held.");
@@ -430,14 +456,44 @@ export class SeatDeliveryGuard {
       if (!this.needsInputCheck(name)) return;
       const target = this.target(name);
       const lease = this.scope.getStore()!.get(target.nodeId)!;
-      lease.staged = { text, collapsedPaste: null };
-      let input: ComposerInput | null = null;
-      for (let read = 0; read < PASTE_SETTLE_READS; read++) {
-        if (read > 0) await new Promise(resolve => setTimeout(resolve, PASTE_SETTLE_INTERVAL_MS));
-        input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
-        if (input && input.state !== "unknown") break;
+      const watch: PasteWatch = { reads: 0, unknownReads: 0, notDrawnReads: 0, ownTextReads: 0, foreignReads: 0, labelSeen: false, labelAdopted: false, labelFirstSeenMs: null };
+      const staged: NonNullable<Lease["staged"]> = { text, collapsedPaste: null, watch };
+      lease.staged = staged;
+      const started = Date.now();
+      while (watch.reads < PASTE_WATCH_READS && Date.now() - started < PASTE_WATCH_MS) {
+        if (watch.reads > 0) await new Promise(resolve => setTimeout(resolve, PASTE_SETTLE_INTERVAL_MS));
+        const input = await this.inspectInput?.(target, lease.inputFrame ? { text, frame: lease.inputFrame } : undefined).catch(() => null) ?? null;
+        const elapsed = Date.now() - started;
+        watch.reads++;
+        if (!input || input.state === "unknown") { watch.unknownReads++; continue; }
+        // The seat can draw the paste a moment after it lands, so the first reads may still show the box exactly as
+        // it was before the paste. Only before our text or a label has shown (an empty box after them is a human's),
+        // and only within RAW_COLLAPSE_MS: a box that still looks untouched after that may have lost our paste, and a
+        // label a human pastes into it later shares nothing that proves it ours. Only unreadable reads earn the full
+        // watch.
+        if (input.state === "empty" && watch.ownTextReads === 0 && !watch.labelSeen && elapsed < RAW_COLLAPSE_MS
+          && !!input.frame && input.frame === lease.inputFrame) { watch.notDrawnReads++; continue; }
+        if (composerContainsOwnedText(input, text)) {
+          watch.ownTextReads++;
+          // One line never collapses; several may, but only within RAW_COLLAPSE_MS.
+          if (!text.includes("\n") || elapsed >= RAW_COLLAPSE_MS) break;
+          continue;
+        }
+        if (input.collapsedPaste) {
+          watch.labelSeen = true;
+          watch.labelFirstSeenMs = elapsed;
+          // Adopted by line count only straight after the paste: before any foreign read, and either before our raw
+          // text was ever read (the box was unreadable until the label) or within RAW_COLLAPSE_MS of the paste.
+          if (watch.foreignReads === 0 && (watch.ownTextReads === 0 || elapsed <= RAW_COLLAPSE_MS)) {
+            staged.collapsedPaste = ownCollapsedPaste(input, text);
+            watch.labelAdopted = staged.collapsedPaste !== null;
+          }
+          break;
+        }
+        // An empty box or other text: the paste is no longer provably ours.
+        watch.foreignReads++;
+        break;
       }
-      if (input) lease.staged.collapsedPaste = ownCollapsedPaste(input, text);
     } catch { /* Observation cannot turn a completed paste into a claimed no-write failure. */ }
   }
 
