@@ -467,8 +467,11 @@ export class SeatDeliveryGuard {
         watch.reads++;
         if (!input || input.state === "unknown") { watch.unknownReads++; continue; }
         // The seat can draw the paste a moment after it lands, so the first reads may still show the box exactly as
-        // it was before the paste. Only before our text or a label has shown: an empty box after them is a human's.
-        if (input.state === "empty" && watch.ownTextReads === 0 && !watch.labelSeen
+        // it was before the paste. Only before our text or a label has shown (an empty box after them is a human's),
+        // and only within RAW_COLLAPSE_MS: a box that still looks untouched after that may have lost our paste, and a
+        // label a human pastes into it later shares nothing that proves it ours. Only unreadable reads earn the full
+        // watch.
+        if (input.state === "empty" && watch.ownTextReads === 0 && !watch.labelSeen && elapsed < RAW_COLLAPSE_MS
           && !!input.frame && input.frame === lease.inputFrame) { watch.notDrawnReads++; continue; }
         if (composerContainsOwnedText(input, text)) {
           watch.ownTextReads++;
