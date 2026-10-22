@@ -5,8 +5,11 @@
 //                "hidden"    no readable composer for hideMs, then the label
 //                "immediate" the label at once (the case OpenRig already handles)
 //                "none"      never collapses
-//   config.foreign: { afterMs, text, mode }  a human-like clear-and-paste of other text afterMs after our paste,
-//                                             drawn by its own mode (default "raw")
+//   config.renderDelayMs: the seat draws a paste this long after it lands (default 0); until then the box
+//                         still shows what it showed before the paste
+//   config.foreign: { afterMs, text, mode, clearMs }  a human-like clear-and-paste of other text afterMs after our
+//                                             paste, drawn by its own mode (default "raw"); with clearMs the box
+//                                             shows empty that long before the other text lands
 // Like a live Claude seat on this rig, the footer reads "… · ← for agents" only while the box is empty.
 // Enter submits the full text behind the label. The state file records the input and every submission.
 import { writeFileSync, renameSync } from "node:fs";
@@ -62,12 +65,14 @@ process.stdin.on("data", data => {
     if (pending.startsWith("\x1b[200~")) { pasting = true; pasted = ""; pending = pending.slice(6); continue; }
     if (pending.startsWith("\x1b[201~")) {
       pasting = false; pending = pending.slice(6);
-      input += pasted;
-      collapse(pasted, config.mode);
+      const landed = pasted;
+      const draw = () => { input += landed; collapse(landed, config.mode); };
+      if (config.renderDelayMs) later(config.renderDelayMs, draw); else draw();
       if (config.foreign) {
         const foreign = config.foreign; config.foreign = undefined;
         // The human's paste replaces ours, so ours never collapses.
-        later(foreign.afterMs, () => { clearTimeout(collapsing); input = foreign.text; collapse(foreign.text, foreign.mode ?? "raw"); });
+        const replace = () => { input = foreign.text; collapse(foreign.text, foreign.mode ?? "raw"); };
+        later(foreign.afterMs, () => { clearTimeout(collapsing); if (!foreign.clearMs) return replace(); input = ""; view = "raw"; later(foreign.clearMs, replace); });
       }
       continue;
     }

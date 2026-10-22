@@ -29,6 +29,8 @@ import { SessionTransport } from "../src/domain/session-transport.js";
 // Cases:
 //   1. (A) submits once, with the full text; the box ends empty; the row is delivered.
 //   2. (B) the same.
+//   1b, 1c. (C) the seat draws the paste 40 ms after it lands, so the first read after the paste still shows the empty
+//      pre-paste box; then a label at once (1b), or our text and then the label (1c): each submitted once (review r1).
 //   3. A human-like clear-and-paste of other text with the same line count, 40 ms after ours (shown raw, then
 //      collapsed): Enter is refused, nothing is submitted, the other text is untouched, and the refusal record shows
 //      what the paste-time reads saw (shape only: no box text, no label text).
@@ -36,6 +38,9 @@ import { SessionTransport } from "../src/domain/session-transport.js";
 //      collapses at once, so no read sees it raw. The other block is never submitted and stays in the box: either ours
 //      was submitted first, or Enter is refused. A label that first shows after our own text has sat on screen longer
 //      than a moment is not ours.
+//   3c. Our text shows, a human clears it (the box is empty, as before the paste, for 100 ms) and pastes another
+//      same-line-count block that collapses at once, all within 300 ms: refused, nothing submitted, untouched. An empty
+//      box after our own text isn't "not drawn yet" (review r1).
 //   4. A multi-line message that never collapses, a label shown at once, and a one-line message all still submit,
 //      each within 4 s.
 //   4d. A box that never becomes readable after the paste: the send gives up within 4 s, sends no Enter, and says so
@@ -104,6 +109,10 @@ async function submitsOnce(config: object, id: string, text: string) {
 describe.skipIf(process.platform === "win32")("AF-148: a delivery's own late-collapsed paste is submitted; another paste never is", () => {
   it("1. (A) our text first, then the label 100 ms later: submitted once", () => submitsOnce({ mode: "raw", collapseMs: 100 }, "late-raw", ours), 30_000);
 
+  it("1b. (C) the paste is drawn 40 ms late, then a label at once: submitted once", () => submitsOnce({ mode: "immediate", renderDelayMs: 40 }, "late-draw-label", ours), 30_000);
+
+  it("1c. (C) the paste is drawn 40 ms late, our text first, then the label: submitted once", () => submitsOnce({ mode: "raw", collapseMs: 100, renderDelayMs: 40 }, "late-draw-raw", ours), 30_000);
+
   it("2. (B) no readable composer for 800 ms, then the label: submitted once", () => submitsOnce({ mode: "hidden", hideMs: 800 }, "late-hidden", ours), 30_000);
 
   it("3. another same-line-count paste replaces ours before it collapses: refused, untouched, recorded by shape", async () => {
@@ -144,6 +153,17 @@ describe.skipIf(process.platform === "win32")("AF-148: a delivery's own late-col
         expect(state().submissions).toEqual([]);
         expect(row("replaced-at-once").result?.refusedInput?.paste?.labelAdopted).toBe(false);
       }
+    });
+  }, 30_000);
+
+  it("3c. a human clears our text and pastes a same-line-count block that collapses at once, within 300 ms: refused", async () => {
+    await seat({ mode: "none", foreign: { afterMs: 60, clearMs: 100, text: foreign, mode: "immediate" } }, async ({ send, state, row }) => {
+      const result = await send("cleared-replaced", ours);
+      expect(result).toMatchObject({ ok: false, sent: true, reason: "draft_input_changed", delivery: { state: "indeterminate" } });
+      await pause(1500);   // longer than any settle window: no late Enter
+      expect(state()).toEqual({ input: foreign, submissions: [] });
+      expect(row("cleared-replaced").result?.refusedInput?.paste?.labelAdopted).toBe(false);
+      expect(row("cleared-replaced").result?.refusedInput?.paste?.foreignReads).toBeGreaterThanOrEqual(1);
     });
   }, 30_000);
 
