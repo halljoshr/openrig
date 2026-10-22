@@ -41,6 +41,9 @@ import { SessionTransport } from "../src/domain/session-transport.js";
 //   3c. Our text shows, a human clears it (the box is empty, as before the paste, for 100 ms) and pastes another
 //      same-line-count block that collapses at once, all within 300 ms: refused, nothing submitted, untouched. An empty
 //      box after our own text isn't "not drawn yet" (review r1).
+//   3d. The seat never draws our paste (the box stays empty, as before it), and 600 ms later a human pastes a
+//      same-line-count block that collapses at once: the human's block is never submitted and stays in the box. An unchanged
+//      box counts as "not drawn yet" for 300 ms only (pre-PR review BLOCKING).
 //   4. A multi-line message that never collapses, a label shown at once, and a one-line message all still submit,
 //      each within 4 s.
 //   4d. A box that never becomes readable after the paste: the send gives up within 4 s, sends no Enter, and says so
@@ -164,6 +167,16 @@ describe.skipIf(process.platform === "win32")("AF-148: a delivery's own late-col
       expect(state()).toEqual({ input: foreign, submissions: [] });
       expect(row("cleared-replaced").result?.refusedInput?.paste?.labelAdopted).toBe(false);
       expect(row("cleared-replaced").result?.refusedInput?.paste?.foreignReads).toBeGreaterThanOrEqual(1);
+    });
+  }, 30_000);
+
+  it("3d. our paste is never drawn, then a human same-line-count paste collapses at once at 600 ms: never submitted", async () => {
+    await seat({ mode: "immediate", renderDelayMs: 20_000, foreign: { afterMs: 600, text: foreign, mode: "immediate" } }, async ({ send, state, row }) => {
+      const result = await send("never-drawn", ours);
+      await pause(1500);   // longer than any settle window: no late Enter
+      expect(result).toMatchObject({ ok: false, sent: true });
+      expect(state()).toEqual({ input: foreign, submissions: [] });
+      expect(row("never-drawn").result?.refusedInput?.paste?.labelAdopted).toBe(false);
     });
   }, 30_000);
 
