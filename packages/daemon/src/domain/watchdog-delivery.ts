@@ -64,7 +64,7 @@ export function makeWatchdogDeliver(deps: {
       const previous = outbox.getById(deliveryId);
       const payload = previous?.guardBinding ? previous.body : formatWatchdogDeliveryMessage(source, message);
       const result = await sessionTransport.send(targetSession, payload,
-        { deliveryId, actorSession: "watchdog@system", auditPointer: source.jobId });
+        { deliveryId, actorSession: "watchdog@system", auditPointer: source.jobId, ownPasteOnly: true });
       if (result.outcome === "retained") return { status: "retained", outboxIds: result.outboxIds, continuityActionCompleted };
       return result.ok
         ? { status: "ok", continuityActionCompleted }
@@ -115,7 +115,7 @@ async function sendDigest(
   let state: "delivered" | "failed" | "indeterminate";
   try {
     const result = await sessionTransport.send(targetSession, payload,
-      { committedOutboxIds: ids, actorSession: "watchdog@system", auditPointer: source.jobId });
+      { committedOutboxIds: ids, actorSession: "watchdog@system", auditPointer: source.jobId, ownPasteOnly: true });
     if (result.outcome === "retained") return { status: "retained", outboxIds: result.outboxIds ?? ids };
     outcome = result.ok ? { status: "ok" } : { status: "failed", error: result.error };
     state = result.ok ? "delivered" : result.sent === false ? "failed" : "indeterminate";

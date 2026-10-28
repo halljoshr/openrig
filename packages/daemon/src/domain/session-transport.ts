@@ -1552,6 +1552,13 @@ export function readInputBox(pane: string | null, runtime: "claude-code" | "code
   return boxHoldsText(stripBoxGlyph(pane.split("\n").slice(markerLine! - 1, closingRuleLine! - 1)), text);
 }
 
+// AF-186: an own-paste delivery waits this long after Enter before it reads the box, repeats Enter at most this many
+// times in all, and gives an unreadable box this many more reads, this far apart, before it stops looking.
+const OWN_SUBMIT_CONFIRM_MS = 250;
+const OWN_SUBMIT_MAX_ENTERS = 3;
+const OWN_SUBMIT_UNREADABLE_READS = 3;
+const OWN_SUBMIT_UNREADABLE_MS = 150;
+
 export interface SendOpts {
   /** Internal provenance derived by the authenticated transport route. */
   identityProvenance?: string;
@@ -1570,6 +1577,12 @@ export interface SendOpts {
   auditPointer?: string;
   /** Internal queue seam: already committed original members, never client-supplied. */
   committedOutboxIds?: string[];
+  /** Internal, set only by the watchdog's delivery (AF-186): the sender knows the text it pastes is its own, so it
+   *  submits it and confirms the box emptied, and it never writes onto a person's draft. On a seat whose typing guard
+   *  is off, this one delivery gets draft-aware semantics (the empty-box check before the paste, the paste watch, the
+   *  ownership check before every Enter), unless the box cannot be read at all, which keeps today's delivery. An
+   *  Enter that did not empty the box is repeated, a bounded number of times, while the box holds only this text. */
+  ownPasteOnly?: boolean;
   verify?: boolean;
   force?: boolean;
   waitForIdleMs?: number;
@@ -2225,6 +2238,16 @@ export class SessionTransport {
         }
       }
       const result = await guard.operation(sessionName, async () => {
+        if (sendOpts?.ownPasteOnly && this.guardedDelivery && !sendOpts.submitOnly) {
+          // The watchdog's own paste (AF-186): on a seat with the guard off it gets the draft-aware checks too, so it never
+          // lands on a person's draft, unless the box cannot be read at all: that seat keeps today's delivery (a held wake
+          // nothing hands over would be worse).
+          if (!guard.needsInputCheck(sessionName)) {
+            const box = await guard.readInput(sessionName);
+            if (box && box.state !== "unknown") guard.enforceDraftAware(sessionName);
+          }
+          if (guard.needsInputCheck(sessionName)) guard.keepStagedUntilConfirmed(sessionName);
+        }
         if (this.guardedDelivery && !sendOpts?.submitOnly && guard.needsInputCheck(sessionName)) {
           // Up to its durable record a draft-aware send is still the caller's: one that went away while this send
           // waited for the lease ends here, unless a record for this delivery already exists. DraftAwareDelivery.send
@@ -2989,6 +3012,14 @@ export class SessionTransport {
           ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
         });
       }
+      // AF-186: the watchdog's own paste. Enter can be lost while the seat is still taking the paste in, so the box is read
+      // and, while it still holds only this delivery's text, Enter is repeated (each time through the guard's ownership
+      // check), a bounded number of times.
+      const guard = this.tmuxAdapter.deliveryGuard;
+      if (opts?.ownPasteOnly && guard?.needsInputCheck(sessionName)) {
+        const unconfirmed = await this.confirmOwnSubmit(sessionName, guard, opts);
+        if (unconfirmed) return observe(unconfirmed);
+      }
     } catch (error) {
       if (error && typeof error === "object") Object.assign(error, { inputWritten: true, enterAttempted: enterIssued });
       throw error;
@@ -3046,6 +3077,39 @@ export class SessionTransport {
     }
 
     return observe({ ok: true, sessionName, ...interaction, ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+  }
+
+  /** After the first Enter of an own-paste delivery: null when the box is seen empty, or cannot be read (the Enter was
+   *  sent, as for any send); a failed result when the text is still there after the last Enter, or a later Enter was
+   *  refused because the box holds more than this delivery's text. */
+  private async confirmOwnSubmit(sessionName: string, guard: SeatDeliveryGuard, opts: SendOpts): Promise<SendResult | null> {
+    const failed = (reason: string, error: string): SendResult =>
+      ({ ok: false, sessionName, reason, outcome: "failed", inputPhase: "written", sent: true, error });
+    const read = async () => {
+      let input = await guard.readInput(sessionName);
+      for (let i = 0; i < OWN_SUBMIT_UNREADABLE_READS && (!input || input.state === "unknown"); i++) {
+        await this.sleep(OWN_SUBMIT_UNREADABLE_MS);
+        input = await guard.readInput(sessionName);
+      }
+      return input && input.state !== "unknown" ? input : null;
+    };
+    for (let enters = 1; ; enters++) {
+      await this.sleep(OWN_SUBMIT_CONFIRM_MS);
+      const input = await read();
+      if (!input) return null;
+      if (input.state === "empty") { guard.clearStaged(sessionName); return null; }
+      if (enters >= OWN_SUBMIT_MAX_ENTERS) {
+        return failed("submit_unconfirmed", `Enter was sent ${enters} times, but the text is still in '${sessionName}'. The agent may need manual attention.`);
+      }
+      const again = await this.tmuxAdapter.sendKeys(sessionName, ["Enter"], opts.beforeWrite);
+      if (!again.ok) {
+        // The refusal may only mean the box emptied between the read and the check.
+        if ((await read())?.state === "empty") { guard.clearStaged(sessionName); return null; }
+        const policyRefusal = typeof again.code === "string" && again.code.startsWith("draft_");
+        return failed(policyRefusal ? again.code : "submit_failed",
+          `Text is in '${sessionName}', but a further Enter was not sent: ${again.message}`);
+      }
+    }
   }
 
   private inputBoxSettingOn(): boolean {
