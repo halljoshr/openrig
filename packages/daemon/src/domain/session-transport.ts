@@ -2243,8 +2243,9 @@ export class SessionTransport {
           // lands on a person's draft, unless the box cannot be read at all: that seat keeps today's delivery (a held wake
           // nothing hands over would be worse).
           if (!guard.needsInputCheck(sessionName)) {
-            const box = await guard.readInput(sessionName);
-            if (box && box.state !== "unknown") guard.enforceDraftAware(sessionName);
+            // A live seat redraws its box for a moment now and then: one unreadable read is not "cannot be read".
+            const box = await this.readSettledInput(guard, sessionName);
+            if (box) guard.enforceDraftAware(sessionName);
           }
           if (guard.needsInputCheck(sessionName)) guard.keepStagedUntilConfirmed(sessionName);
         }
@@ -3000,15 +3001,7 @@ export class SessionTransport {
       if (!submitResult.ok) {
         const policyRefusal = typeof submitResult.code === "string" && submitResult.code.startsWith("draft_");
         return observe({
-          ok: false,
-          sessionName,
-          reason: policyRefusal ? submitResult.code : "submit_failed",
-          outcome: "failed",
-          inputPhase: "written",
-          error: policyRefusal
-            ? `Text is in '${sessionName}', but Enter was not sent: ${submitResult.message}`
-            : `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
-          ...(policyRefusal && submitResult.refusedInput ? { refusedInput: submitResult.refusedInput } : {}),
+          ...this.submitRefusal(sessionName, submitResult),
           ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
         });
       }
@@ -3085,14 +3078,7 @@ export class SessionTransport {
   private async confirmOwnSubmit(sessionName: string, guard: SeatDeliveryGuard, opts: SendOpts): Promise<SendResult | null> {
     const failed = (reason: string, error: string): SendResult =>
       ({ ok: false, sessionName, reason, outcome: "failed", inputPhase: "written", sent: true, error });
-    const read = async () => {
-      let input = await guard.readInput(sessionName);
-      for (let i = 0; i < OWN_SUBMIT_UNREADABLE_READS && (!input || input.state === "unknown"); i++) {
-        await this.sleep(OWN_SUBMIT_UNREADABLE_MS);
-        input = await guard.readInput(sessionName);
-      }
-      return input && input.state !== "unknown" ? input : null;
-    };
+    const read = () => this.readSettledInput(guard, sessionName);
     for (let enters = 1; ; enters++) {
       await this.sleep(OWN_SUBMIT_CONFIRM_MS);
       const input = await read();
@@ -3105,11 +3091,36 @@ export class SessionTransport {
       if (!again.ok) {
         // The refusal may only mean the box emptied between the read and the check.
         if ((await read())?.state === "empty") { guard.clearStaged(sessionName); return null; }
-        const policyRefusal = typeof again.code === "string" && again.code.startsWith("draft_");
-        return failed(policyRefusal ? again.code : "submit_failed",
-          `Text is in '${sessionName}', but a further Enter was not sent: ${again.message}`);
+        return { ...this.submitRefusal(sessionName, again), sent: true };
       }
     }
+  }
+
+  /** One read of the box, repeated a bounded number of times while it reads unknown. Null when it stays unreadable. */
+  private async readSettledInput(guard: SeatDeliveryGuard, sessionName: string): Promise<ComposerInput | null> {
+    let input = await guard.readInput(sessionName);
+    for (let i = 0; i < OWN_SUBMIT_UNREADABLE_READS && (!input || input.state === "unknown"); i++) {
+      await this.sleep(OWN_SUBMIT_UNREADABLE_MS);
+      input = await guard.readInput(sessionName);
+    }
+    return input && input.state !== "unknown" ? input : null;
+  }
+
+  /** The result for an Enter the adapter refused or that failed, after the text was written: the guard's own refusal
+   *  keeps its code and the shape of the input it read. Shared by the first Enter and a repeated one. */
+  private submitRefusal(sessionName: string, result: { code?: string; message?: string; refusedInput?: RefusedInput }): SendResult {
+    const policyRefusal = typeof result.code === "string" && result.code.startsWith("draft_");
+    return {
+      ok: false,
+      sessionName,
+      reason: policyRefusal ? result.code : "submit_failed",
+      outcome: "failed",
+      inputPhase: "written",
+      error: policyRefusal
+        ? `Text is in '${sessionName}', but Enter was not sent: ${result.message}`
+        : `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
+      ...(policyRefusal && result.refusedInput ? { refusedInput: result.refusedInput } : {}),
+    };
   }
 
   private inputBoxSettingOn(): boolean {
