@@ -47,6 +47,15 @@ import { formatWatchdogDeliveryMessage } from "../src/domain/watchdog-policy-eng
 //      pasted and submitted once (the lead's call: such a seat keeps today's delivery, never a held wake nobody hands
 //      over).
 //   9b. Draft-aware, a box OpenRig can't read: nothing pasted, nothing submitted, held (today's behaviour, kept).
+// Pre-PR review (AF-186 vet):
+//   10. Guard off, a human's draft, the box unreadable for its first reads only (a redraw): nothing pasted, held. Only a
+//       box that stays unreadable keeps today's paste-and-Enter (MEDIUM).
+//   11. Another sender (a plain transport send, not the watchdog) to a guard-off seat whose first Enter is lost: one
+//       Enter, no retry, as today (MEDIUM: other senders unchanged).
+//   11b. The same on a draft-aware seat: one Enter, no retry (the retry is the watchdog's own).
+//   12. Another sender to a guard-off seat with a draft: still pasted onto it, as today (MEDIUM: other senders unchanged).
+//   13. A watchdog digest (several occurrences in one send) with the first Enter lost: submitted once (LOW).
+//   14. The wake submitted, then a human types 200 ms later, before the first confirm read: reported delivered (LOW).
 // Not covered, accepted in the plan: a label that first shows more than 300 ms after the paste. AF-148 refuses it
 // because a human's paste looks the same, and AF-186 keeps that rule.
 const run = promisify(execFile);
@@ -60,6 +69,8 @@ type State = { input: string; submissions: string[]; enters: number };
 
 async function seat(config: object, mode: "off" | "draft-aware", fn: (h: {
   deliver: (occ: string) => Promise<{ status: string; error?: string }>;
+  digest: (occs: string[]) => Promise<{ status: string; error?: string }>;
+  plain: (text: string) => Promise<{ ok: boolean }>;
   payload: (occ: string) => string;
   state: () => State;
 }) => Promise<void>) {
@@ -89,6 +100,9 @@ async function seat(config: object, mode: "off" | "draft-aware", fn: (h: {
     const deliver = makeWatchdogDeliver({ sessionTransport: transport, outbox: new OutboxHandler(db), db });
     await fn({
       deliver: occ => deliver({ targetSession: "worker@test", message: wake }, source(occ)) as Promise<{ status: string; error?: string }>,
+      digest: occs => deliver({ targetSession: "worker@test", message: wake }, { jobId: `digest-${occs.join("+")}`, policy: "parked-owner-consumer",
+        occurrenceId: `digest-${occs.join("+")}`, members: occs.map(o => ({ jobId: `job-${o}`, occurrenceId: o })) } as never) as Promise<{ status: string; error?: string }>,
+      plain: text => transport!.send("worker@test", text, { deliveryId: `plain-${Date.now()}`, actorSession: "sender@test" }) as Promise<{ ok: boolean }>,
       payload: occ => formatWatchdogDeliveryMessage(source(occ) as never, wake),
       state,
     });
@@ -187,6 +201,61 @@ describe.skipIf(process.platform === "win32")("AF-186: the watchdog submits its 
       expect(outcome.status).toBe("retained");
       await pause(1500);
       expect(state()).toMatchObject({ input: "", submissions: [], enters: 0 });
+    });
+  }, 30_000);
+
+  it("10. guard off, a human's draft, the box unreadable for its first reads only: nothing pasted, held", async () => {
+    await seat({ draft, unreadableMs: 450 }, "off", async ({ deliver, state }) => {
+      const outcome = await deliver("redraw-draft");
+      expect(outcome.status).toBe("retained");
+      await pause(1500);
+      expect(state()).toMatchObject({ input: draft, submissions: [], enters: 0 });
+    });
+  }, 30_000);
+
+  const other = "a message from another seat\nline two";
+  it("11. another sender, guard off, the first Enter lost: one Enter, no retry (unchanged)", async () => {
+    await seat({ swallowEnters: 1 }, "off", async ({ plain, state }) => {
+      expect((await plain(other)).ok).toBe(true);   // reported as today: Enter was sent
+      await pause(1500);
+      expect(state().enters).toBe(1);
+      expect(state().submissions).toEqual([]);
+    });
+  }, 30_000);
+
+  it("11b. another sender, draft-aware, the first Enter lost: one Enter, no retry (unchanged)", async () => {
+    await seat({ swallowEnters: 1 }, "draft-aware", async ({ plain, state }) => {
+      expect((await plain(other)).ok).toBe(true);   // reported as today: Enter was sent
+      await pause(1500);
+      expect(state().enters).toBe(1);
+      expect(state().submissions).toEqual([]);
+    });
+  }, 30_000);
+
+  it("12. another sender, guard off, a human's draft: still pasted onto it (unchanged)", async () => {
+    await seat({ draft }, "off", async ({ plain, state }) => {
+      await plain(other);
+      await pause(1500);
+      expect(state().submissions).toEqual([`${draft}${other}`]);
+    });
+  }, 30_000);
+
+  it("13. a watchdog digest with the first Enter lost: submitted once", async () => {
+    await seat({ swallowEnters: 1 }, "off", async ({ digest, state }) => {
+      const outcome = await digest(["dig-a", "dig-b"]);
+      expect(outcome.status).toBe("ok");
+      await vi.waitFor(() => expect(state().submissions).toHaveLength(1), { timeout: 3000 });
+      expect(state().submissions[0]).toContain(wake);
+      expect(state().input).toBe("");
+    });
+  }, 30_000);
+
+  it("14. the wake submitted, then a human types 200 ms later: reported delivered", async () => {
+    await seat({ typeAfterEnterMs: 200, typeText: "next thought" }, "off", async ({ deliver, payload, state }) => {
+      const outcome = await deliver("typed-after-submit");
+      expect(outcome.status).toBe("ok");
+      expect(state().submissions).toEqual([payload("typed-after-submit")]);
+      expect(state().input).toBe("next thought");
     });
   }, 30_000);
 });

@@ -5,6 +5,8 @@
 //   config.typeAfterPasteMs, config.typeText: a human types typeText this long after a paste lands
 //   config.typeAfterEnterMs: a human types typeText this long after the first Enter that follows a paste arrives
 //   config.unreadable:     the composer never draws a readable box (like a runtime whose box OpenRig can't read)
+//   config.unreadableMs:   the box is unreadable for this long after the composer starts, then readable (a redraw)
+//   config.unreadableAfterEnterMs: the box is unreadable for this long after the first Enter that follows a paste
 //   config.collapseMs:     a multi-line paste shows raw first and collapses this long after it's drawn (default 0: at once)
 //   config.renderDelayMs:  the seat draws a paste this long after it lands; until then the box shows what it showed before
 // A multi-line paste collapses into "[Pasted text #N +M lines]", at once or after collapseMs, as a live Claude seat does
@@ -17,14 +19,15 @@ import stringWidth from "string-width";
 const [stateFile, configJson] = process.argv.slice(2);
 const config = { swallowEnters: 0, ...JSON.parse(configJson ?? "{}") };
 let input = config.draft ?? "", pending = "", pasting = false, pasted = "", pastes = 0, label = "";
-let swallow = 0, enters = 0, enteredSincePaste = false;
+let swallow = 0, enters = 0, enteredSincePaste = false, hidden = !!config.unreadableMs;
+if (config.unreadableMs) setTimeout(() => { hidden = false; render(); }, config.unreadableMs);
 const submissions = [];
 const decoder = new StringDecoder("utf8");
 
 function render() {
   const rows = ["Editable delivery fixture", ...submissions.slice(-3).flatMap(text => text.split("\n"))];
   let cursor = [rows.length + 1, 1];
-  if (config.unreadable) {
+  if (config.unreadable || hidden) {
     rows.push("✻ Working…");
   } else {
     rows.push("────────────────────────────────────────");
@@ -74,6 +77,9 @@ process.stdin.on("data", data => {
       if (!enteredSincePaste && config.typeAfterEnterMs && config.typeText) {
         const text = config.typeText; config.typeText = undefined;
         setTimeout(() => { input += text; label = ""; render(); }, config.typeAfterEnterMs);
+      }
+      if (!enteredSincePaste && config.unreadableAfterEnterMs) {
+        hidden = true; setTimeout(() => { hidden = false; render(); }, config.unreadableAfterEnterMs);
       }
       enteredSincePaste = true;
       if (swallow > 0) { swallow--; continue; }
