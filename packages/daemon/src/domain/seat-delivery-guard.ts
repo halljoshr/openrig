@@ -56,6 +56,9 @@ interface Lease {
   humanEpoch: number;
   inputFrame?: string;
   staged?: { text: string; collapsedPaste: string | null; watch?: PasteWatch };
+  /** The sender submits and confirms its own paste (AF-186): noteSubmitted keeps `staged` until the box is seen empty,
+   *  so a repeated Enter is still checked against the paste it submits. */
+  keepStaged?: boolean;
 }
 
 /** The shape of the last input read when the guard refused, so the next refusal shows its trigger. It holds no box
@@ -501,8 +504,40 @@ export class SeatDeliveryGuard {
     try {
       const target = this.maybeTarget(name);
       const lease = target && this.scope.getStore()?.get(target.nodeId);
-      if (lease) lease.staged = undefined;
+      if (lease && !lease.keepStaged) lease.staged = undefined;
     } catch { /* Enter already succeeded. */ }
+  }
+
+  /** One read of the seat's input box, outside any check: null when it cannot be read. */
+  async readInput(name: string): Promise<ComposerInput | null> {
+    const target = this.maybeTarget(name);
+    if (!target) return null;
+    return await this.inspectInput?.(target).catch(() => null) ?? null;
+  }
+
+  /** The active automatic lease for this seat, if any. */
+  private automaticLease(name: string): Lease | null {
+    const target = this.maybeTarget(name);
+    const lease = target && this.scope.getStore()?.get(target.nodeId);
+    return lease && lease.active && lease.origin === "automatic" ? lease : null;
+  }
+
+  /** AF-186: give the current delivery draft-aware semantics on a seat whose guard is off. It lasts as long as this
+   *  operation's lease; the seat's saved mode is not touched. */
+  enforceDraftAware(name: string): void {
+    const lease = this.automaticLease(name);
+    if (lease && lease.config?.mode !== "draft-aware") lease.config = { mode: "draft-aware", revision: "own-paste-only" };
+  }
+
+  /** AF-186: keep the staged paste after Enter, until clearStaged (the box was seen empty). */
+  keepStagedUntilConfirmed(name: string): void {
+    const lease = this.automaticLease(name);
+    if (lease) lease.keepStaged = true;
+  }
+
+  clearStaged(name: string): void {
+    const lease = this.automaticLease(name);
+    if (lease) { lease.staged = undefined; lease.keepStaged = false; }
   }
 
   /** Reconciliation is a synchronous DB transaction, not a nested input operation.

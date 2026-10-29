@@ -72,6 +72,8 @@ A large paste can appear as several labels plus a literal tail. The existing
 boundary. That complete rendering must be observed after this operation's paste
 and remain unchanged before Enter. Labels alone do not prove arbitrary content.
 
+Watchdog wakes are the one sender that knows the text it pastes is its own. On a seat whose guard is off, a wake gets these draft-aware checks too when the input is readable, and is held while a person's draft is in the box; it then confirms its own Enter, repeating it up to 3 Enters in all while the box holds only that wake, and reports `submit_unconfirmed` if the text is still there after the last one. An input that stays unreadable keeps the plain delivery: one Enter.
+
 | Delivery state | Meaning |
 |---|---|
 | `sending` | The original IDs have an unresolved write attempt |
